@@ -40,7 +40,22 @@
         <system>Github</system>
         <url>https://github.com/killbill/killbill-email-notifications-plugin/issues</url>
     </issueManagement>
+
+    <properties>
+        <commons.lang.version>2.6</commons.lang.version>
+        <mybatis.spring.version>1.2.2</mybatis.spring.version>
+        <!-- Persistence -->
+        <mybatis.version>3.2.8</mybatis.version>
+
+        <!-- JDBC -->
+        <mysql.version>5.1.34</mysql.version>
+
+        <!-- JSON -->
+        <jackson.version>2.4.4</jackson.version>
+    </properties>
+
     <dependencies>
+
         <dependency>
             <groupId>com.google.code.findbugs</groupId>
             <artifactId>jsr305</artifactId>
@@ -62,8 +77,17 @@
         </dependency>
         <dependency>
             <groupId>org.kill-bill.billing.plugin</groupId>
+            <artifactId>killbill-plugin-api-invoice</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.kill-bill.billing.plugin</groupId>
             <artifactId>killbill-plugin-api-notification</artifactId>
             <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.kill-bill.billing.plugin.java</groupId>
+            <artifactId>killbill-base-plugin</artifactId>
         </dependency>
         <dependency>
             <groupId>org.kill-bill.billing</groupId>
@@ -126,6 +150,57 @@
             <artifactId>testng</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!--추가된 디펜던시-->
+
+        <!-- ================= -->
+        <!--  Jakarta Commons  -->
+        <!-- ================= -->
+        <dependency>
+            <groupId>commons-lang</groupId>
+            <artifactId>commons-lang</artifactId>
+            <version>${commons.lang.version}</version>
+        </dependency>
+
+        <!-- ====================== -->
+        <!--  MyBatis && Mysql Dependencies  -->
+        <!-- ====================== -->
+
+        <dependency>
+            <groupId>mysql</groupId>
+            <artifactId>mysql-connector-java</artifactId>
+            <version>${mysql.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.mybatis</groupId>
+            <artifactId>mybatis</artifactId>
+            <version>${mybatis.version}</version>
+        </dependency>
+
+        <!-- ====== -->
+        <!--  JSON  -->
+        <!-- ====== -->
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <!--추가된 디펜던시 end-->
     </dependencies>
 
     <build>
@@ -171,7 +246,24 @@
                             javax.naming;
                             javax.net;
                             javax.net.ssl;
-                            version="[0,3)",
+                            org.xml.sax.helpers;
+                            org.xml.sax;
+                            org.w3c.dom;
+                            org.w3c.dom.ls,
+                            org.killbill.billing.osgi.api;
+                            org.killbill.billing.osgi.api.config;
+                            sun.misc;
+                            javax.management;
+                            javax.xml;
+                            javax.xml.parsers;
+                            javax.xml.xpath;
+                            org.osgi.service.log;
+                            org.apache.ibatis;
+                            com.mysql.jdbc;
+                            javax.sql;
+                            javax.sql.DataSource;
+                            <!--*;resolution:=optional-->
+                            <!--version="[0,3)",-->
                             *;resolution:=optional
                         </Import-Package>
                     </instructions>

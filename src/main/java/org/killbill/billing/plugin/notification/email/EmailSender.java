@@ -83,6 +83,7 @@ public class EmailSender {
 
     public void sendHTMLEmail(final List<String> to, final List<String> cc, final String subject, final String htmlBody) throws EmailException {
         final HtmlEmail email = new HtmlEmail();
+        email.setCharset("utf-8");
         email.setHtmlMsg(htmlBody);
         sendEmail(to, cc, subject, email);
     }
@@ -96,6 +97,7 @@ public class EmailSender {
                 body));
 
         final SimpleEmail email = new SimpleEmail();
+        email.setCharset("utf-8");
         email.setMsg(body);
         sendEmail(to, cc, subject, email);
     }
@@ -106,6 +108,7 @@ public class EmailSender {
             return;
         }
 
+        email.setCharset("utf-8");
         email.setSmtpPort(useSmtpPort);
         if (useSmtpAuth) {
             email.setAuthentication(smtpUserName, smtpUserPassword);

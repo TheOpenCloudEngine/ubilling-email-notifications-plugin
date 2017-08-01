@@ -18,6 +18,7 @@
 package org.killbill.billing.plugin.notification.generator;
 
 import com.google.common.base.Strings;
+import org.killbill.billing.account.api.Account;
 import org.killbill.billing.account.api.AccountData;
 import org.killbill.billing.entitlement.api.Subscription;
 import org.killbill.billing.invoice.api.Invoice;
@@ -28,12 +29,21 @@ import org.killbill.billing.plugin.notification.generator.formatters.DefaultInvo
 import org.killbill.billing.plugin.notification.generator.formatters.PaymentFormatter;
 import org.killbill.billing.plugin.notification.templates.TemplateEngine;
 import org.killbill.billing.plugin.notification.templates.TemplateType;
+import org.killbill.billing.plugin.notification.uengine.model.NotificationConfig;
+import org.killbill.billing.plugin.notification.uengine.util.JsonUtils;
 import org.killbill.billing.plugin.notification.util.IOUtils;
 import org.killbill.billing.plugin.notification.util.LocaleUtils;
 import org.killbill.billing.tenant.api.TenantApiException;
 import org.killbill.billing.tenant.api.TenantUserApi;
 import org.killbill.billing.util.callcontext.TenantContext;
 import org.osgi.service.log.LogService;
+import org.killbill.billing.plugin.notification.uengine.model.NotificationType;
+import org.killbill.billing.plugin.notification.uengine.model.Organization;
+import org.killbill.billing.plugin.notification.uengine.model.Template;
+import org.killbill.billing.plugin.notification.uengine.service.InvoiceExtService;
+import org.xml.sax.EntityResolver;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
 
 import javax.annotation.Nullable;
 import java.io.IOException;
@@ -65,44 +75,42 @@ public class TemplateRenderer {
     }
 
 
-    public EmailContent generateEmailForUpComingInvoice(final AccountData account, final Invoice invoice, final TenantContext context) throws IOException, TenantApiException {
-        return getEmailContent(TemplateType.UPCOMING_INVOICE, account, null, invoice, null, context);
+    public EmailContent generateEmailForUpComingInvoice(final Account account, final Invoice invoice, final TenantContext context) throws IOException, TenantApiException {
+        return getEmailContent(NotificationType.INVOICE, TemplateType.UPCOMING_INVOICE, account, null, invoice, null, context);
     }
 
-    public EmailContent generateEmailForSuccessfulPayment(final AccountData account, final Invoice invoice, final TenantContext context) throws IOException, TenantApiException {
-        return getEmailContent(TemplateType.SUCCESSFUL_PAYMENT, account, null, invoice, null, context);
+    public EmailContent generateEmailForSuccessfulPayment(final Account account, final Invoice invoice, final TenantContext context) throws IOException, TenantApiException {
+        return getEmailContent(NotificationType.SUCCESSFUL_PAYMENT, TemplateType.SUCCESSFUL_PAYMENT, account, null, invoice, null, context);
     }
 
-    public EmailContent generateEmailForFailedPayment(final AccountData account, final Invoice invoice, final TenantContext context) throws IOException, TenantApiException {
-        return getEmailContent(TemplateType.FAILED_PAYMENT, account, null, invoice, null, context);
+    public EmailContent generateEmailForFailedPayment(final Account account, final Invoice invoice, final TenantContext context) throws IOException, TenantApiException {
+        return getEmailContent(NotificationType.FAILED_PAYMENT, TemplateType.FAILED_PAYMENT, account, null, invoice, null, context);
     }
 
-    public EmailContent generateEmailForPaymentRefund(final AccountData account, final PaymentTransaction paymentTransaction, final TenantContext context) throws IOException, TenantApiException {
-        return getEmailContent(TemplateType.PAYMENT_REFUND, account, null, null, paymentTransaction, context);
+    public EmailContent generateEmailForPaymentRefund(final Account account, final PaymentTransaction paymentTransaction, final TenantContext context) throws IOException, TenantApiException {
+        return getEmailContent(NotificationType.PAYMENT_REFUND, TemplateType.PAYMENT_REFUND, account, null, null, paymentTransaction, context);
     }
 
-    public EmailContent generateEmailForSubscriptionCancellationRequested(final AccountData account, final Subscription subscription, final TenantContext context) throws IOException, TenantApiException {
-        return getEmailContent(TemplateType.SUBSCRIPTION_CANCELLATION_REQUESTED, account, subscription, null, null, context);
+    public EmailContent generateEmailForSubscriptionCancellationRequested(final Account account, final Subscription subscription, final TenantContext context) throws IOException, TenantApiException {
+        return getEmailContent(NotificationType.SUBSCRIPTION_CANCELLATION_REQUESTED, TemplateType.SUBSCRIPTION_CANCELLATION_REQUESTED, account, subscription, null, null, context);
     }
 
-    public EmailContent generateEmailForSubscriptionCancellationEffective(final AccountData account, final Subscription subscription, final TenantContext context) throws IOException, TenantApiException {
-        return getEmailContent(TemplateType.SUBSCRIPTION_CANCELLATION_EFFECTIVE, account, subscription, null, null, context);
+    public EmailContent generateEmailForSubscriptionCancellationEffective(final Account account, final Subscription subscription, final TenantContext context) throws IOException, TenantApiException {
+        return getEmailContent(NotificationType.SUBSCRIPTION_CANCELLATION_EFFECTIVE, TemplateType.SUBSCRIPTION_CANCELLATION_EFFECTIVE, account, subscription, null, null, context);
     }
 
-    private EmailContent getEmailContent(final TemplateType templateType, final AccountData account, @Nullable Subscription subscription, @Nullable final Invoice invoice, @Nullable final PaymentTransaction paymentTransaction, final TenantContext context) throws IOException, TenantApiException {
+    private EmailContent getEmailContent(final NotificationType notificationType, final TemplateType templateType, final Account account, @Nullable Subscription subscription, @Nullable final Invoice invoice, @Nullable final PaymentTransaction paymentTransaction, final TenantContext context) throws IOException, TenantApiException {
 
         final String accountLocale = Strings.emptyToNull(account.getLocale());
         final Locale locale = accountLocale == null ? Locale.getDefault() : LocaleUtils.toLocale(accountLocale);
 
         final Map<String, Object> data = new HashMap<String, Object>();
-        final Map<String, String> text = getTranslationMap(accountLocale, ResourceBundleFactory.ResourceBundleType.TEMPLATE_TRANSLATION, context);
-        data.put("text", text);
         data.put("account", account);
         if (subscription != null) {
             data.put("subscription", subscription);
         }
         if (invoice != null) {
-            final InvoiceFormatter formattedInvoice = new DefaultInvoiceFormatter(text, invoice, locale);
+            final InvoiceFormatter formattedInvoice = new DefaultInvoiceFormatter(new HashMap<String, String>(), invoice, locale);
             data.put("invoice", formattedInvoice);
         }
         if (paymentTransaction != null) {
@@ -110,10 +118,61 @@ public class TemplateRenderer {
             data.put("payment", formattedPayment);
         }
 
-        final String templateText = getTemplateText(locale, templateType, context);
-        final String body = templateEngine.executeTemplateText(templateText, data);
-        final String subject = new StringBuffer((String) text.get("merchantName")).append(": ").append(text.get(templateType.getSubjectKeyName())).toString();
-        return new EmailContent(subject, body);
+        InvoiceExtService invoiceExtService = new InvoiceExtService();
+        Organization organization = invoiceExtService.selectOrganizationFromAccountId(account.getId().toString());
+        Template currentTemplate = null;
+        if (organization != null) {
+
+            NotificationConfig notificationConfig = invoiceExtService.selectConfigByOrgId(organization.getId());
+            String configuration = notificationConfig.getConfiguration();
+            Map configMap = JsonUtils.unmarshal(configuration);
+
+            //organization 에 인보이스 발송 설정이 금지일 경우 보내지 않는다.
+            final boolean send = (Boolean) configMap.get(notificationType.toString());
+            if (!send) {
+                return null;
+            }
+
+            List<Template> templates = invoiceExtService.selectByOrgIdAndType(organization.getId(), notificationType.toString());
+
+            //템플릿 중, 어카운트의 로케일과 같은 것을 찾는다.
+            for (final Template template : templates) {
+                if (template.getLocale().equals(account.getLocale())) {
+                    currentTemplate = template;
+                }
+            }
+            //템플릿이 없다면, 디폴트 템플릿을 찾는다.
+            if (currentTemplate == null) {
+                for (final Template template : templates) {
+                    if ("Y".equals(template.getIs_default())) {
+                        currentTemplate = template;
+                    }
+                }
+            }
+        }
+
+        //조직이 없거나, currentTemplate 을 찾을 수 없는 경우 원래 로직대로 처리한다.
+        if (organization == null || currentTemplate == null) {
+            final Map<String, String> text = getTranslationMap(accountLocale, ResourceBundleFactory.ResourceBundleType.TEMPLATE_TRANSLATION, context);
+            data.put("text", text);
+
+            final String templateText = getTemplateText(locale, templateType, context);
+            final String body = templateEngine.executeTemplateText(templateText, data);
+            final String subject = new StringBuffer((String) text.get("merchantName")).append(": ").append(text.get(templateType.getSubjectKeyName())).toString();
+            return new EmailContent(subject, body);
+        }
+
+
+        // 1. 인보이스 제목을 템플릿의 subject 에서 가져온다.
+        // 2. 인보이스 바디를 템플릿의 body 에서 가져온다.
+        else {
+            //조직 데이터 추가
+            data.put("organization", organization);
+            final String subject = templateEngine.executeTemplateText(currentTemplate.getSubject(), data);
+            final String body = templateEngine.executeTemplateText(currentTemplate.getBody(), data);
+            return new EmailContent(subject, body);
+        }
+
     }
 
     private Map<String, String> getTranslationMap(final String accountLocale, final ResourceBundleFactory.ResourceBundleType bundleType, final TenantContext context) throws TenantApiException {
@@ -138,7 +197,8 @@ public class TemplateRenderer {
         }
 
         // TODO Caching strategy
-        final String templateTenantKey = LocaleUtils.localeString(locale, templateType.getTemplateKey());
+//        final String templateTenantKey = LocaleUtils.localeString(locale, templateType.getTemplateKey());
+        final String templateTenantKey = templateType.getTemplateKey();
         final List<String> result = tenantApi.getTenantValuesForKey(templateTenantKey, context);
         if (result.size() == 1) {
 

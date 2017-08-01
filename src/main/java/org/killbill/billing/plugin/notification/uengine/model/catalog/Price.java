@@ -1,6 +1,6 @@
 /*
- * Copyright 2015-2015 Groupon, Inc
- * Copyright 2015-2015 The Billing Project, LLC
+ * Copyright 2014-2017 Groupon, Inc
+ * Copyright 2014-2017 The Billing Project, LLC
  *
  * The Billing Project licenses this file to you under the Apache License, version 2.0
  * (the "License"); you may not use this file except in compliance with the
@@ -15,18 +15,30 @@
  * under the License.
  */
 
-package org.killbill.billing.plugin.notification.templates;
+package org.killbill.billing.plugin.notification.uengine.model.catalog;
 
-import java.util.Map;
+import java.math.BigDecimal;
 
-import com.samskivert.mustache.Mustache;
-import com.samskivert.mustache.Template;
+/**
+ * Created by uengine on 2017. 2. 3..
+ */
+public class Price {
+    private String currency;
+    private BigDecimal value;
 
-public class MustacheTemplateEngine implements TemplateEngine {
+    public String getCurrency() {
+        return currency;
+    }
 
-    @Override
-    public String executeTemplateText(final String templateText, final Map<String, Object> data) {
-        final Template template = Mustache.compiler().nullValue("").compile(templateText);
-        return template.execute(data);
+    public void setCurrency(String currency) {
+        this.currency = currency;
+    }
+
+    public BigDecimal getValue() {
+        return value;
+    }
+
+    public void setValue(BigDecimal value) {
+        this.value = value;
     }
 }

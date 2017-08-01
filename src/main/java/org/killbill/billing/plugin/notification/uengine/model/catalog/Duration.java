@@ -1,6 +1,6 @@
 /*
- * Copyright 2015-2015 Groupon, Inc
- * Copyright 2015-2015 The Billing Project, LLC
+ * Copyright 2014-2017 Groupon, Inc
+ * Copyright 2014-2017 The Billing Project, LLC
  *
  * The Billing Project licenses this file to you under the Apache License, version 2.0
  * (the "License"); you may not use this file except in compliance with the
@@ -15,18 +15,28 @@
  * under the License.
  */
 
-package org.killbill.billing.plugin.notification.templates;
+package org.killbill.billing.plugin.notification.uengine.model.catalog;
 
-import java.util.Map;
+/**
+ * Created by uengine on 2017. 2. 2..
+ */
+public class Duration {
+    private String unit;
+    private Long number;
 
-import com.samskivert.mustache.Mustache;
-import com.samskivert.mustache.Template;
+    public String getUnit() {
+        return unit;
+    }
 
-public class MustacheTemplateEngine implements TemplateEngine {
+    public void setUnit(String unit) {
+        this.unit = unit;
+    }
 
-    @Override
-    public String executeTemplateText(final String templateText, final Map<String, Object> data) {
-        final Template template = Mustache.compiler().nullValue("").compile(templateText);
-        return template.execute(data);
+    public Long getNumber() {
+        return number;
+    }
+
+    public void setNumber(Long number) {
+        this.number = number;
     }
 }

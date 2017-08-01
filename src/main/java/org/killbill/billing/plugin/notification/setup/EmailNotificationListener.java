@@ -23,6 +23,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.samskivert.mustache.MustacheException;
 
+import org.apache.commons.lang.StringUtils;
 import org.apache.commons.mail.EmailException;
 import org.joda.time.DateTime;
 import org.joda.time.LocalDate;
@@ -30,17 +31,11 @@ import org.killbill.billing.account.api.Account;
 import org.killbill.billing.account.api.AccountApiException;
 import org.killbill.billing.account.api.AccountEmail;
 import org.killbill.billing.catalog.api.BillingActionPolicy;
+import org.killbill.billing.catalog.api.Currency;
 import org.killbill.billing.catalog.api.PlanPhasePriceOverride;
 import org.killbill.billing.catalog.api.PlanPhaseSpecifier;
-import org.killbill.billing.entitlement.api.Entitlement;
-import org.killbill.billing.entitlement.api.Subscription;
-import org.killbill.billing.entitlement.api.SubscriptionApiException;
-import org.killbill.billing.entitlement.api.SubscriptionEventType;
-import org.killbill.billing.invoice.api.DryRunArguments;
-import org.killbill.billing.invoice.api.DryRunType;
-import org.killbill.billing.invoice.api.Invoice;
-import org.killbill.billing.invoice.api.InvoiceApiException;
-import org.killbill.billing.invoice.api.InvoicePayment;
+import org.killbill.billing.entitlement.api.*;
+import org.killbill.billing.invoice.api.*;
 import org.killbill.billing.notification.plugin.api.ExtBusEvent;
 import org.killbill.billing.notification.plugin.api.ExtBusEventType;
 import org.killbill.billing.osgi.libs.killbill.OSGIConfigPropertiesService;
@@ -59,6 +54,13 @@ import org.killbill.billing.plugin.notification.email.EmailSender;
 import org.killbill.billing.plugin.notification.generator.ResourceBundleFactory;
 import org.killbill.billing.plugin.notification.generator.TemplateRenderer;
 import org.killbill.billing.plugin.notification.templates.MustacheTemplateEngine;
+import org.killbill.billing.plugin.notification.uengine.model.*;
+import org.killbill.billing.plugin.notification.uengine.model.catalog.Phase;
+import org.killbill.billing.plugin.notification.uengine.model.catalog.Plan;
+import org.killbill.billing.plugin.notification.uengine.model.catalog.Usage;
+import org.killbill.billing.plugin.notification.uengine.repository.InvoiceExtRepository;
+import org.killbill.billing.plugin.notification.uengine.service.InvoiceExtService;
+import org.killbill.billing.plugin.notification.uengine.util.JsonUtils;
 import org.killbill.billing.tenant.api.TenantApiException;
 import org.killbill.billing.util.callcontext.TenantContext;
 import org.osgi.service.log.LogService;
@@ -66,8 +68,9 @@ import org.skife.config.TimeSpan;
 
 import javax.annotation.Nullable;
 import java.io.IOException;
-import java.util.List;
-import java.util.UUID;
+import java.math.BigDecimal;
+import java.text.SimpleDateFormat;
+import java.util.*;
 
 public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OSGIKillbillEventHandler {
 
@@ -83,9 +86,17 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
     private final OSGIKillbillClock clock;
 
 
+    /**
+     * 수용해야 할 이벤트
+     * INVOICE_CREATION : 수익 분배율을 추가한다.
+     * INVOICE_ADJUSTMENT : 수익 분배율을 차감한다.
+     * INVOICE_PAYMENT_SUCCESS: 결제 성공 이메일
+     * INVOICE_PAYMENT_FAILED : 결제 실패 이메일
+     * SUBSCRIPTION_CANCEL : 구독 취소 이메일
+     */
     private final ImmutableList<ExtBusEventType> EVENTS_TO_CONSIDER = new ImmutableList.Builder()
-            .add(ExtBusEventType.INVOICE_NOTIFICATION)
             .add(ExtBusEventType.INVOICE_CREATION)
+            .add(ExtBusEventType.INVOICE_ADJUSTMENT)
             .add(ExtBusEventType.INVOICE_PAYMENT_SUCCESS)
             .add(ExtBusEventType.INVOICE_PAYMENT_FAILED)
             .add(ExtBusEventType.SUBSCRIPTION_CANCEL)
@@ -122,8 +133,13 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
 
             final EmailNotificationContext context = new EmailNotificationContext(killbillEvent.getTenantId());
             switch (killbillEvent.getEventType()) {
-                case INVOICE_NOTIFICATION:
-                    sendEmailForUpComingInvoice(account, killbillEvent, context);
+
+                case INVOICE_ADJUSTMENT:
+                    reduceProductDistributionHistory(account, killbillEvent, context);
+                    break;
+
+                case INVOICE_CREATION:
+                    addProductDistributionHistory(account, killbillEvent, context);
                     break;
 
                 case INVOICE_PAYMENT_SUCCESS:
@@ -163,6 +179,439 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
         } finally {
             Thread.currentThread().setContextClassLoader(previousClassLoader);
         }
+    }
+
+    /**
+     * Adjustment 된 인보이스를 바탕으로 판매 이력에서 차감한다.
+     *
+     * @param account
+     * @param killbillEvent
+     * @param context
+     * @throws InvoiceApiException
+     * @throws IOException
+     * @throws EmailException
+     * @throws TenantApiException
+     */
+    private void reduceProductDistributionHistory(final Account account, final ExtBusEvent killbillEvent, final TenantContext context) throws InvoiceApiException, IOException, EmailException, TenantApiException {
+        Preconditions.checkArgument(killbillEvent.getEventType() == ExtBusEventType.INVOICE_ADJUSTMENT, String.format("Unexpected event %s", killbillEvent.getEventType()));
+
+        final UUID invoiceId = killbillEvent.getObjectId();
+        final Invoice invoice = osgiKillbillAPI.getInvoiceUserApi().getInvoice(invoiceId, context);
+        List<InvoiceItem> invoiceItems = invoice.getInvoiceItems();
+        InvoiceExtService invoiceExtService = new InvoiceExtService();
+        Organization organization = invoiceExtService.selectOrganizationFromAccountId(account.getId().toString());
+        if (organization == null) {
+            return;
+        }
+
+        //킬빌의 현재시각
+        Date currentDate = clock.getClock().getUTCNow().toDate();
+
+        for (InvoiceItem invoiceItem : invoiceItems) {
+
+            //REPAIR_ADJ 또는 ITEM_ADJ 만 해당된다.
+            InvoiceItemType invoiceItemType = invoiceItem.getInvoiceItemType();
+            if (!invoiceItemType.toString().equals(InvoiceItemType.REPAIR_ADJ.toString()) &&
+                    !invoiceItemType.toString().equals(InvoiceItemType.ITEM_ADJ.toString())) {
+                continue;
+            }
+
+            //링크 아이템이 없는 경우 해당되지 않는다.
+            if (invoiceItem.getLinkedItemId() == null) {
+                continue;
+            }
+
+            //해당 이력이 저장되었는지 확인하기. 해당 이력이 있을 경우 해당되지 않는다.
+            List<ProductDistributionHistory> existHistories = invoiceExtService.selectHistoryByItemId(invoiceItem.getId().toString());
+            if (existHistories != null && existHistories.size() > 0) {
+                continue;
+            }
+
+            //원본 인보이스 아이템 트랜잭션 가져오기.
+            List<ProductDistributionHistory> originalItems = new ArrayList<ProductDistributionHistory>();
+            List<ProductDistributionHistory> histories = invoiceExtService.selectHistoryByItemId(invoiceItem.getLinkedItemId().toString());
+            if (histories != null) {
+                for (ProductDistributionHistory history : histories) {
+                    if (DistributionTransactionType.CREATION.toString().equals(history.getTransaction_type())) {
+                        originalItems.add(history);
+                    }
+                }
+            }
+            //원본 인보이스 아이템이 없을 경우 해당되지 않는다.
+            if (originalItems.isEmpty()) {
+                continue;
+            }
+
+            //원본 내용대로 트랜잭션 저장하기.
+            for (ProductDistributionHistory originalItem : originalItems) {
+
+                //인보이스 아이템의 가격 조정된 가격 = original_amount
+                //인보이스 아이템의 가격 조정된 가격 * 구매시 적용되었던 ratio * 0.01 = amount
+                BigDecimal original_amount = invoiceItem.getAmount();
+                BigDecimal ratio = originalItem.getRatio();
+                BigDecimal amount = original_amount.multiply(ratio).multiply(new BigDecimal("0.01"));
+
+                originalItem.setRecord_id(null);
+                originalItem.setAmount(amount);
+                originalItem.setOriginal_amount(original_amount);
+                originalItem.setInvoice_id(invoice.getId().toString());
+                originalItem.setInvoice_item_id(invoiceItem.getId().toString());
+                originalItem.setLinked_invoice_item_id(invoiceItem.getLinkedItemId().toString());
+                originalItem.setInvoice_item_type(invoiceItem.getInvoiceItemType().toString());
+                originalItem.setTransaction_type(DistributionTransactionType.ADJUSTMENT.toString());
+
+                SimpleDateFormat format1 = new SimpleDateFormat("yyyy-MM-dd");
+                String formatDate = format1.format(currentDate);
+                originalItem.setFormat_date(formatDate);
+                originalItem.setCreated_date(currentDate);
+
+                //이제 저장하면 된다.
+                invoiceExtService.insertHistory(originalItem);
+            }
+        }
+    }
+
+    /**
+     * 발급된 인보이스를 바탕으로 판매 이력을 추가한다.
+     *
+     * @param account
+     * @param killbillEvent
+     * @param context
+     * @throws InvoiceApiException
+     * @throws IOException
+     * @throws EmailException
+     * @throws TenantApiException
+     */
+    private void addProductDistributionHistory(final Account account, final ExtBusEvent killbillEvent, final TenantContext context) throws InvoiceApiException, IOException, EmailException, TenantApiException {
+        Preconditions.checkArgument(killbillEvent.getEventType() == ExtBusEventType.INVOICE_CREATION, String.format("Unexpected event %s", killbillEvent.getEventType()));
+
+        final UUID invoiceId = killbillEvent.getObjectId();
+        final Invoice invoice = osgiKillbillAPI.getInvoiceUserApi().getInvoice(invoiceId, context);
+        List<InvoiceItem> invoiceItems = invoice.getInvoiceItems();
+        InvoiceExtService invoiceExtService = new InvoiceExtService();
+        Organization organization = invoiceExtService.selectOrganizationFromAccountId(account.getId().toString());
+        if (organization == null) {
+            return;
+        }
+
+        //킬빌의 현재시각
+        Date currentDate = clock.getClock().getUTCNow().toDate();
+
+//        인보이스 이벤트 리스너에서 원타임 구매 기록에 대한 벤더분배율을 기록하기.
+//
+//                아이템 중에 서브스크립션 아이디가 없고 플랜 네임만 있는 경우 원타임 페이먼트 이다.
+//                해당 구매일에 맞는 버젼의 가격을 찾아, 분배율을 기록하도록 한다.
+
+        //원타임 구매 모델의 분배 규칙을 수행한다.
+        for (InvoiceItem invoiceItem : invoiceItems) {
+            //서브스크립션 아이디가 없고, 플랜네임이 있으며, 익스터널 차지 아이템 ==> 원타임 구매 아이템이다.
+            boolean isOneTimeItem = false;
+            if (invoiceItem.getSubscriptionId() == null && !StringUtils.isEmpty(invoiceItem.getPlanName())
+                    && invoiceItem.getInvoiceItemType().equals(InvoiceItemType.EXTERNAL_CHARGE)) {
+                isOneTimeItem = true;
+            }
+
+            if (!isOneTimeItem) {
+                continue;
+            }
+
+            try {
+                //해당 인보이스 아이템 아이디의 원타임 구매 기록을 가져온다.
+                OneTimeBuy oneTimeBuy = invoiceExtService.selectOneTimeBuyByItemId(invoiceItem.getId().toString());
+                if (oneTimeBuy == null) {
+                    continue;
+                }
+
+                //구매 기록의 프로덕트, 플랜, 버젼으로 플랜과 프로덕트를 획득한다.
+                String plan_name = oneTimeBuy.getPlan_name();
+                Long version = oneTimeBuy.getVersion();
+                String product_id = oneTimeBuy.getProduct_id();
+
+                Product product = invoiceExtService.selectProductById(product_id);
+                ProductVersion productVersion = invoiceExtService.selectProductVersionByVersion(product_id, version);
+
+                List<Plan> plans = productVersion.getPlans();
+                Plan plan = null;
+                for (Plan plan_ : plans) {
+                    if (plan_.getName().equals(plan_name)) {
+                        plan = plan_;
+                    }
+                }
+                if (plan == null) {
+                    continue;
+                }
+
+                //최종 결정된 프로덕트, 플랜 벤더 분배율로 최종 벤더 분베율을 구한다.
+                List<Vendor> vendors = new ArrayList<Vendor>();
+                if (plan.getOverwriteVendors() != null) {
+                    vendors = plan.getOverwriteVendors();
+                } else if (product.getVendors() != null) {
+                    vendors = product.getVendors();
+                }
+
+                //벤더의 합이 100 을 넘으면 안된다.
+                BigDecimal organization_ratio = null;
+                BigDecimal total = new BigDecimal("0");
+                for (Vendor vendor : vendors) {
+                    BigDecimal ratio = vendor.getRatio();
+                    total = total.add(ratio);
+                }
+
+                //벤더 분배율 합이 100 이 넘을 경우, vendor 리스트를 비우고, organization 비율을 100 으로 설정한다.
+                if (total.compareTo(new BigDecimal("100")) == 1) {
+                    vendors = new ArrayList<Vendor>();
+                    organization_ratio = new BigDecimal("100");
+                    Vendor vendor = new Vendor();
+                    vendor.setAccount_id("organization");
+                    vendor.setRatio(organization_ratio);
+                    vendors.add(vendor);
+                }
+                //그 외의 경우 100 에서 벤더 분배율을 뺀 비율이 organization 몫이다.
+                else {
+                    organization_ratio = new BigDecimal("100").subtract(total);
+                    Vendor vendor = new Vendor();
+                    vendor.setAccount_id("organization");
+                    vendor.setRatio(organization_ratio);
+                    vendors.add(vendor);
+                }
+
+                //각 ratio 에 따라 인서트를 수행한다.
+                for (Vendor vendor : vendors) {
+                    BigDecimal original_amount = invoiceItem.getAmount();
+                    BigDecimal ratio = vendor.getRatio();
+                    BigDecimal amount = original_amount.multiply(ratio).multiply(new BigDecimal("0.01"));
+
+                    ProductDistributionHistory history = new ProductDistributionHistory();
+                    history.setSubscription_id(null);
+                    history.setTenant_id(organization.getTenant_id());
+                    history.setOrganization_id(organization.getId());
+                    history.setBuyer_id(account.getId().toString());
+                    history.setVendor_id(vendor.getAccount_id());
+                    history.setProduct_id(product_id);
+                    history.setVersion(version);
+                    history.setPlan_name(plan_name);
+                    history.setUsage_name(null);
+                    history.setRatio(vendor.getRatio());
+                    history.setAmount(amount);
+                    history.setOriginal_amount(original_amount);
+                    history.setCurrency(invoiceItem.getCurrency().toString());
+                    history.setInvoice_id(invoice.getId().toString());
+                    history.setInvoice_item_id(invoiceItem.getId().toString());
+                    history.setInvoice_item_type(invoiceItem.getInvoiceItemType().toString());
+                    history.setPrice_type("ONE_TIME");
+                    history.setTransaction_type(DistributionTransactionType.CREATION.toString());
+
+                    SimpleDateFormat format1 = new SimpleDateFormat("yyyy-MM-dd");
+                    String formatDate = format1.format(currentDate);
+                    history.setFormat_date(formatDate);
+                    history.setCreated_date(currentDate);
+
+                    //이제 저장하면 된다.
+                    invoiceExtService.insertHistory(history);
+                }
+            } catch (Exception ex) {
+
+            }
+        }
+
+
+        //서브스크립션 모델의 프로덕트 분배 규칙을 수행한다.
+        for (InvoiceItem invoiceItem : invoiceItems) {
+            String planName = invoiceItem.getPlanName();
+            String usageName = invoiceItem.getUsageName();
+
+            UUID subscriptionId = invoiceItem.getSubscriptionId();
+            if (subscriptionId == null) {
+                continue;
+            }
+            try {
+                Subscription subscription = osgiKillbillAPI.getSubscriptionApi().getSubscriptionForEntitlementId(subscriptionId, context);
+
+                //=== 서브스크립션 적용 날짜 구하기 ====
+                //서브스크립션 이벤트 중, 현재 시각보다 이전인 구독 변경 이력 중 가장 나중인 것을 찾는다.
+                Date effectiveVersionDate = null;
+                List<SubscriptionEvent> subscriptionEvents = subscription.getSubscriptionEvents();
+                for (SubscriptionEvent subscriptionEvent : subscriptionEvents) {
+                    SubscriptionEventType eventType = subscriptionEvent.getSubscriptionEventType();
+
+                    //변경 이력의 이벤트타입이며, nextPlan 명이 인보이스 아이템 플랜명과 같을 경우
+                    if (SubscriptionEventType.CHANGE.toString().equals(eventType.name())
+                            && planName.equals(subscriptionEvent.getNextPlan().getName())) {
+                        LocalDate changeDate = subscriptionEvent.getEffectiveDate();
+
+                        //킬빌의 시각보다 이전 시각이라면
+                        if (changeDate.toDate().getTime() < currentDate.getTime()) {
+
+                            //가장 나중일 경우에만 치환한다.
+                            if (effectiveVersionDate == null) {
+                                effectiveVersionDate = changeDate.toDate();
+                            } else {
+                                if (effectiveVersionDate.getTime() < changeDate.toDate().getTime()) {
+                                    effectiveVersionDate = changeDate.toDate();
+                                }
+                            }
+                        }
+                    }
+                }
+                //해당 하는 구독 변경 이력이 없다면, 서브스크립션 시작일로 지정한다.
+                if (effectiveVersionDate == null) {
+                    for (SubscriptionEvent subscriptionEvent : subscriptionEvents) {
+                        SubscriptionEventType eventType = subscriptionEvent.getSubscriptionEventType();
+                        if (SubscriptionEventType.START_ENTITLEMENT.toString().equals(eventType.name())) {
+                            effectiveVersionDate = subscriptionEvent.getEffectiveDate().toDate();
+                        }
+                    }
+                }
+                //최종 적용 날짜를 구하지 못하였다면, 현재시각으로 대체한다.
+                if (effectiveVersionDate == null) {
+                    effectiveVersionDate = currentDate;
+                }
+
+
+                //== 적용 플랜 구하기 ==
+                //플랜명으로부터 프로덕트 아이디를 얻어온 후, 프로덕트와 해당 프로덕트의 모든 버젼을 불러온다.
+                String product_id = planName.substring(0, 14);
+                Product product = invoiceExtService.selectProductById(product_id);
+                List<ProductVersion> productVersions = invoiceExtService.selectVersionByProductId(product_id);
+
+
+                //이펙티브 데이트에 해당하는 플랜을 선정한다.
+                //플랜을 포함한 버젼을 선출한다. 유서지네임이 있는 경우, 유서지네임을 포함한 플랜을 선출한다.
+                ProductVersion maxTimeVersion = null;
+                Plan maxTimePlan = null;
+                Usage maxTimeUsage = null;
+                for (ProductVersion productVersion : productVersions) {
+                    List<Plan> plans = productVersion.getPlans();
+                    Plan matchPlan = null;
+                    Usage matchUsage = null;
+
+                    for (Plan plan : plans) {
+                        //버젼에 해당 플랜이 있다면
+                        if (planName.equals(plan.getName())) {
+                            //유서지가 없는 경우는 matchPlan 에 등록.
+                            if (usageName == null) {
+                                matchPlan = plan;
+                            }
+                            //유서지가 있는 경우는 플랜이 유서지를 포함해야 matchPlan 과 matchUsage 등록.
+                            else {
+                                List<Phase> initialPhases = plan.getInitialPhases();
+                                if (initialPhases != null) {
+                                    for (Phase initialPhase : initialPhases) {
+                                        if (initialPhase.getUsages() != null) {
+                                            for (Usage usage : initialPhase.getUsages()) {
+                                                if (usageName.equals(usage.getName())) {
+                                                    matchPlan = plan;
+                                                    matchUsage = usage;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Phase finalPhase = plan.getFinalPhase();
+                                if (finalPhase.getUsages() != null) {
+                                    for (Usage usage : finalPhase.getUsages()) {
+                                        if (usageName.equals(usage.getName())) {
+                                            matchPlan = plan;
+                                            matchUsage = usage;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    //플랜 또는 유서지를 가지고 있는 프로덕트 버젼의 effective 날짜와 , 서브스크립션의 적용 날짜를 비교해 적용 버젼을 찾는다.
+                    if (matchPlan != null) {
+                        if (productVersion.getEffective_date().getTime() < effectiveVersionDate.getTime()) {
+                            if (maxTimeVersion == null) {
+                                maxTimeVersion = productVersion;
+                                maxTimePlan = matchPlan;
+                                maxTimeUsage = matchUsage;
+                            } else {
+                                if (maxTimeVersion.getEffective_date().getTime() < productVersion.getEffective_date().getTime()) {
+                                    maxTimeVersion = productVersion;
+                                    maxTimePlan = matchPlan;
+                                    maxTimeUsage = matchUsage;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                //최종 결정된 프로덕트,플랜,유서지의 벤더 분배율로 최종 벤더 분베율을 구한다.
+                List<Vendor> vendors = new ArrayList<Vendor>();
+                if (maxTimeUsage != null && maxTimeUsage.getOverwriteVendors() != null) {
+                    vendors = maxTimeUsage.getOverwriteVendors();
+                } else if (maxTimePlan != null && maxTimePlan.getOverwriteVendors() != null) {
+                    vendors = maxTimePlan.getOverwriteVendors();
+                } else if (product.getVendors() != null) {
+                    vendors = product.getVendors();
+                }
+
+                //벤더의 합이 100 을 넘으면 안된다.
+                BigDecimal organization_ratio = null;
+                BigDecimal total = new BigDecimal("0");
+                for (Vendor vendor : vendors) {
+                    BigDecimal ratio = vendor.getRatio();
+                    total = total.add(ratio);
+                }
+                //벤더 분배율 합이 100 이 넘을 경우, vendor 리스트를 비우고, organization 비율을 100 으로 설정한다.
+                if (total.compareTo(new BigDecimal("100")) == 1) {
+                    vendors = new ArrayList<Vendor>();
+                    organization_ratio = new BigDecimal("100");
+                    Vendor vendor = new Vendor();
+                    vendor.setAccount_id("organization");
+                    vendor.setRatio(organization_ratio);
+                    vendors.add(vendor);
+                }
+                //그 외의 경우 100 에서 벤더 분배율을 뺀 비율이 organization 몫이다.
+                else {
+                    organization_ratio = new BigDecimal("100").subtract(total);
+                    Vendor vendor = new Vendor();
+                    vendor.setAccount_id("organization");
+                    vendor.setRatio(organization_ratio);
+                    vendors.add(vendor);
+                }
+
+                //각 ratio 에 따라 인서트를 수행한다.
+                for (Vendor vendor : vendors) {
+                    BigDecimal original_amount = invoiceItem.getAmount();
+                    BigDecimal ratio = vendor.getRatio();
+                    BigDecimal amount = original_amount.multiply(ratio).multiply(new BigDecimal("0.01"));
+
+                    ProductDistributionHistory history = new ProductDistributionHistory();
+                    history.setSubscription_id(subscriptionId.toString());
+                    history.setTenant_id(organization.getTenant_id());
+                    history.setOrganization_id(organization.getId());
+                    history.setBuyer_id(account.getId().toString());
+                    history.setVendor_id(vendor.getAccount_id());
+                    history.setProduct_id(product_id);
+                    history.setVersion(maxTimeVersion.getVersion());
+                    history.setPlan_name(planName);
+                    history.setUsage_name(usageName);
+                    history.setRatio(vendor.getRatio());
+                    history.setAmount(amount);
+                    history.setOriginal_amount(original_amount);
+                    history.setCurrency(invoiceItem.getCurrency().toString());
+                    history.setInvoice_id(invoice.getId().toString());
+                    history.setInvoice_item_id(invoiceItem.getId().toString());
+                    history.setInvoice_item_type(invoiceItem.getInvoiceItemType().toString());
+                    history.setPrice_type(invoiceItem.getInvoiceItemType().toString());
+                    history.setTransaction_type(DistributionTransactionType.CREATION.toString());
+
+                    SimpleDateFormat format1 = new SimpleDateFormat("yyyy-MM-dd");
+                    String formatDate = format1.format(currentDate);
+                    history.setFormat_date(formatDate);
+                    history.setCreated_date(currentDate);
+
+                    //이제 저장하면 된다.
+                    invoiceExtService.insertHistory(history);
+                }
+            } catch (Exception ex) {
+
+            }
+        }
+
     }
 
     private void sendEmailForUpComingInvoice(final Account account, final ExtBusEvent killbillEvent, final TenantContext context) throws IOException, InvoiceApiException, EmailException, TenantApiException {
@@ -212,6 +661,7 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
             // Aborted payment? Maybe no default payment method...
             return;
         }
+
         final InvoicePayment invoicePayment = invoice.getPayments().get(invoice.getNumberOfPayments() - 1);
 
         final Payment payment = osgiKillbillAPI.getPaymentApi().getPayment(invoicePayment.getPaymentId(), false, false, ImmutableList.<PluginProperty>of(), context);
@@ -239,6 +689,12 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
     }
 
     private void sendEmail(final Account account, final EmailContent emailContent, final TenantContext context) throws IOException, EmailException {
+
+        //organization 의 이메일 설정이 전송 금지일 경우 중지.
+        if (emailContent == null) {
+            return;
+        }
+
         final Iterable<String> cc = Iterables.transform(osgiKillbillAPI.getAccountUserApi().getEmails(account.getId(), context), new Function<AccountEmail, String>() {
             @Nullable
             @Override
@@ -246,7 +702,8 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
                 return input.getEmail();
             }
         });
-        emailSender.sendPlainTextEmail(ImmutableList.of(account.getEmail()), ImmutableList.copyOf(cc), emailContent.getSubject(), emailContent.getBody());
+        //emailSender.sendPlainTextEmail(ImmutableList.of(account.getEmail()), ImmutableList.copyOf(cc), emailContent.getSubject(), emailContent.getBody());
+        emailSender.sendHTMLEmail(ImmutableList.of(account.getEmail()), ImmutableList.copyOf(cc), emailContent.getSubject(), emailContent.getBody());
     }
 
     private static final class EmailNotificationContext implements TenantContext {
