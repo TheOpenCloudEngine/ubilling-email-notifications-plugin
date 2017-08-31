@@ -115,6 +115,38 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
     @Override
     public void handleKillbillEvent(final ExtBusEvent killbillEvent) {
 
+
+//        //TODO. 결제 성공했을 때 이폼서비스에 새로운 알람을 주고싶다.
+//        ExtBusEventType eventType = killbillEvent.getEventType();
+//        if (eventType.equals(ExtBusEventType.PAYMENT_SUCCESS)) {
+//            UUID objectId = killbillEvent.getObjectId();
+//
+//
+//            try {
+//                Payment payment = osgiKillbillAPI.getPaymentApi().getPayment(
+//                        objectId,
+//                        false,
+//                        false,
+//                        null,
+//                        new EmailNotificationContext(killbillEvent.getTenantId()));
+//
+//                //어카운트 아이디로 이폼서비스의 사용자를 찾음.
+//                UUID accountId = payment.getAccountId();
+//
+//
+//                //결제 금액 얻기.
+//                BigDecimal purchasedAmount = payment.getPurchasedAmount();
+//
+//                //결제 통화 얻기.
+//                Currency currency = payment.getCurrency();
+//
+//                //TODO 이폼 서비스 사용에게 결제 금액, 통화 포함하여 푸시 및 이메일을 날리는 코드를 작성하면 됨.
+//            } catch (Exception ex) {
+//
+//            }
+//        }
+
+
         if (!EVENTS_TO_CONSIDER.contains(killbillEvent.getEventType())) {
             return;
         }
