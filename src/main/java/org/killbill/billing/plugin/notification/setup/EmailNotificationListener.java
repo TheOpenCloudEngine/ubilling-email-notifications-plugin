@@ -68,7 +68,12 @@ import org.skife.config.TimeSpan;
 
 import javax.annotation.Nullable;
 import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
 import java.math.BigDecimal;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
@@ -115,36 +120,32 @@ public class EmailNotificationListener implements OSGIKillbillEventDispatcher.OS
     @Override
     public void handleKillbillEvent(final ExtBusEvent killbillEvent) {
 
+        String eventServerHost = System.getProperty("event.server.host");
+        logService.log(LogService.LOG_INFO, "eventServerHost " + eventServerHost);
+        if (!StringUtils.isEmpty(eventServerHost)) {
+            try {
+                String url = eventServerHost;
 
-//        //TODO. 결제 성공했을 때 이폼서비스에 새로운 알람을 주고싶다.
-//        ExtBusEventType eventType = killbillEvent.getEventType();
-//        if (eventType.equals(ExtBusEventType.PAYMENT_SUCCESS)) {
-//            UUID objectId = killbillEvent.getObjectId();
-//
-//
-//            try {
-//                Payment payment = osgiKillbillAPI.getPaymentApi().getPayment(
-//                        objectId,
-//                        false,
-//                        false,
-//                        null,
-//                        new EmailNotificationContext(killbillEvent.getTenantId()));
-//
-//                //어카운트 아이디로 이폼서비스의 사용자를 찾음.
-//                UUID accountId = payment.getAccountId();
-//
-//
-//                //결제 금액 얻기.
-//                BigDecimal purchasedAmount = payment.getPurchasedAmount();
-//
-//                //결제 통화 얻기.
-//                Currency currency = payment.getCurrency();
-//
-//                //TODO 이폼 서비스 사용에게 결제 금액, 통화 포함하여 푸시 및 이메일을 날리는 코드를 작성하면 됨.
-//            } catch (Exception ex) {
-//
-//            }
-//        }
+                URL urlObj = new URL(url);
+                HttpURLConnection httpCon = (HttpURLConnection) urlObj.openConnection();
+
+                httpCon.setDoOutput(true);
+                httpCon.setRequestMethod("POST");
+
+                String marshal = JsonUtils.marshal(killbillEvent);
+                logService.log(LogService.LOG_INFO, "Message send " + marshal);
+
+                OutputStreamWriter writer = new OutputStreamWriter(
+                        httpCon.getOutputStream());
+                writer.write(marshal);
+                writer.flush();
+                writer.close();
+                int responseCode = httpCon.getResponseCode();
+
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
+        }
 
 
         if (!EVENTS_TO_CONSIDER.contains(killbillEvent.getEventType())) {
